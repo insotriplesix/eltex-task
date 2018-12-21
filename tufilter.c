@@ -138,7 +138,7 @@ static int __init tufilter_start(void)
 		return rval;
 	}
 
-	rules = kmalloc(sizeof(rule_t) * MAX_RULES_NUM, GFP_KERNEL);
+	rules = kzalloc(sizeof(rule_t) * MAX_RULES_NUM, GFP_KERNEL);
 
 	if (!rules) {
 		nf_unregister_net_hook(&init_net, &nfho_in);
@@ -266,7 +266,7 @@ static long tufilter_ioctl(struct file *f, unsigned int cmd,
 		case IOCTL_GET_RULE:
 			/* If we reach the table threshold, then goto
 				its first element */
-			if (cur_rules_pos >= MAX_RULES_NUM) {
+			if (cur_rules_pos >= cur_rules_num) {
 				cur_rules_pos = 0;
 			}
 
@@ -343,6 +343,9 @@ static int find_duplicate(rule_t *rule)
 						sz, // full sz of shifted data
 						i + 2, // i + 1 (off) + 1 (table idx)
 						i + 1); // i + 1 (table idx)
+				}
+				else {
+					memset(&rules[0], 0, sizeof(rule_t));
 				}
 				cur_rules_num--;
 				return 1;
