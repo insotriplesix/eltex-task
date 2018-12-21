@@ -7,6 +7,8 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <getopt.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -19,6 +21,33 @@
 
 /* --------------------------------------------------------------- */
 
+#define C_INF "\033[1;36m"
+#define C_ERR "\033[1;31m"
+#define C_WRN "\033[1;33m"
+#define C_DEF "\033[0m"
+
+#define INF(msg, ...) \
+	fprintf(stdout, C_INF"INFO: "C_DEF msg "\n", ##__VA_ARGS__)
+
+#define ERR(msg, ...) \
+	fprintf(stderr, C_ERR"ERR: "C_DEF msg "\n", ##__VA_ARGS__); \
+	close(dev_fd); \
+	exit(EXIT_FAILURE)
+
+#define WRN(msg) \
+	fprintf(stdout, C_WRN"WARN: "C_DEF msg "\n")
+
+static const struct option long_options[] = {
+	{ "ip", required_argument, 0, 'i' },
+	{ "filter", required_argument, 0, 'f' },
+	{ "port", required_argument, 0, 'p' },
+	{ "route", required_argument, 0, 'r' },
+	{ "show", no_argument, 0, 's' },
+	{ "transport", required_argument, 0, 't' },
+	{ "help", no_argument, 0, '?' },
+	{ 0, 0, 0, 0 }
+};
+
 // Flag to dump statistics
 static int show_stats;
 
@@ -26,15 +55,14 @@ static int show_stats;
 static int show_usage;
 
 // IOCTL funcs
-void ioctl_set_rule(int fd, rule_t *rule);
-void ioctl_get_rules(int fd);
+void ioctl_set_rule(rule_t *rule);
+void ioctl_get_rules(void);
 
 // Other stuff
 void init_rule(rule_t *rule);
 void parse_rule(rule_t *rule, int argc, char *argv[]);
-
 void dump_usage_msg(void);
-void dump_err(char *msg);
+int is_valid_ip(char *ip_addr);
 
 static int dev_fd;
 
@@ -53,15 +81,15 @@ int main(int argc, char *argv[])
 	init_rule(&rule);
 	parse_rule(&rule, argc, argv);
 
-	if (rule.port || (strcmp(rule.ip_addr, "N/A") != 0)) {
-		ioctl_set_rule(dev_fd, &rule);
+	if (rule.port || rule.ip_addr) {
+		ioctl_set_rule(&rule);
 	}
 	else {
-		fprintf(stderr, "WARN: port or ip not specified\n");
+		WRN("port or ip not specified");
 	}
 
 	if (show_stats) {
-		ioctl_get_rules(dev_fd);
+		ioctl_get_rules();
 	}
 
 	if (show_usage) {
@@ -73,191 +101,202 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-void ioctl_set_rule(int fd, rule_t *rule)
+void ioctl_set_rule(rule_t *rule)
 {
-	int rval;
-	uint32_t rules_num = MAX_RULES_NUM;
-
-	rval = ioctl(fd, IOCTL_GET_RULES_NUM, &rules_num);
+	int rval = ioctl(dev_fd, IOCTL_SET_RULE, rule);
 	if (rval < 0) {
-		dump_err("ioctl get rules num failed");
-	}
-
-	if ((rules_num >= MAX_RULES_NUM) &&
-		(GET_FILTER((*rule)))) {
-		fprintf(stdout, "INF: table is full\n");
-		return;
-	}
-
-	rval = ioctl(fd, IOCTL_CLR_BUF_POS);
-	if (rval < 0) {
-		dump_err("ioctl clr buf pos failed");
-	}
-
-	rval = ioctl(fd, IOCTL_SET_RULE, rule);
-	if (rval < 0) {
-		dump_err("ioctl set rule failed");
+		ERR("ioctl set rule failed, rval ~> '%d'", rval);
 	}
 }
 
-void ioctl_get_rules(int fd)
+void ioctl_get_rules(void)
 {
-	char port[8]; // port in ascii
+	struct sockaddr_in sa;
+	char ip_addr[INET_ADDRSTRLEN];
+	char port[MAX_PORT_STRLEN]; // port in ascii
+	unsigned rules_num = 0;
 	int rval;
-	uint32_t rules_num = 0;
 	rule_t rule;
 
-	rval = ioctl(fd, IOCTL_GET_RULES_NUM, &rules_num);
+	rval = ioctl(dev_fd, IOCTL_GET_RULES_NUM, &rules_num);
 	if (rval < 0) {
-		dump_err("ioctl get rules num failed");
+		ERR("ioctl get rules num failed, rval ~> '%d'", rval);
 	}
 
 	if (rules_num == 0) {
-		fprintf(stdout, "INF: table is empty\n");
+		INF("table is empty (%u)", rules_num);
 		return;
 	}
 
-	rval = ioctl(fd, IOCTL_CLR_BUF_POS);
+	rval = ioctl(dev_fd, IOCTL_TABLE_ZPOS);
 	if (rval < 0) {
-		dump_err("ioctl clr buf pos failed");
+		ERR("ioctl clr table zpos failed, rval ~> '%d'", rval);
 	}
 
-	puts("+-----------------------------------------------+");
-	puts("|  # |    ip address    |  port | proto | route |");
-	puts("+-----------------------------------------------+");
+	puts("+------------------------------------------------------------+");
+	puts("|  # |    ip address    |  port | proto | route |    drops   |");
+	puts("+------------------------------------------------------------+");
 
-	for (uint32_t i = 0; i < rules_num; ++i) {
-		rval = ioctl(fd, IOCTL_GET_RULE, &rule);
+	for (unsigned i = 0; i < rules_num; ++i) {
+		rval = ioctl(dev_fd, IOCTL_GET_RULE, &rule);
 		if (rval < 0) {
-			dump_err("ioctl get rules failed");
+			ERR("ioctl get rules failed, rval ~> '%d'", rval);
 		}
 
-		// Convert port number into ascii format
+		// Convert a port number into printable format
 		if (rule.port) {
-			sprintf(port, "%d", ntohs(rule.port));
+			sprintf(port, "%hu", rule.port);
 		}
 		else {
 			sprintf(port, "N/A");
 		}
 
-		printf("| %2d | %16s | %5s | %5s | %5s |\n", i + 1,
-			rule.ip_addr, port, GET_PROTO(rule), GET_ROUTE(rule));
+		sa.sin_addr.s_addr = htonl(rule.ip_addr);
+
+		// Convert an ip addr into printable format
+		if (sa.sin_addr.s_addr) {
+			inet_ntop(AF_INET, &(sa.sin_addr), ip_addr,
+				INET_ADDRSTRLEN);
+		}
+		else {
+			sprintf(ip_addr, "N/A");
+		}
+
+		printf("| %2u | %16s | %5s | %5s | %5s | %10u |\n",
+			i + 1, ip_addr, port, ((rule.proto == IPPROTO_TCP)
+			? "TCP" : "UDP"), ((GET_ROUTE(rule)) ? "IN" : "OUT"),
+			rule.drop_cnt);
 	}
 
-	puts("+-----------------------------------------------+");
+	puts("+------------------------------------------------------------+");
 }
 
 void init_rule(rule_t *rule)
 {
-	strcpy(rule->ip_addr, "N/A");
+	rule->drop_cnt = 0;
+	rule->ip_addr = 0;
 	rule->port = 0;
+	rule->proto = 0;
 	rule->flags = 0;
 }
 
 void parse_rule(rule_t *rule, int argc, char *argv[])
 {
+	int arg;
+	int option_idx = 0;
+	unsigned port;
+
+	struct sockaddr_in sa;
+
 	if (argc == 1) {
-		dump_err("no arguments passed");
+		ERR("no arguments passed, argc = %d", argc);
 	}
 
-	for (int i = 1; i < argc; ++i) {
-		if ((strcmp(argv[i], "-i") == 0) ||
-			(strcmp(argv[i], "--ip") == 0)) {
-				if (++i < argc) {
-					if (strlen(argv[i]) < MAX_IP_ADDR_LEN) {
-						sprintf(rule->ip_addr, "%s", argv[i]);
-					}
-					else {
-						dump_err("invalid ip address");
-					}
-				}
+	while (0x1) {
+		arg = getopt_long(argc, argv, "i:f:?p:r:st:",
+			long_options, &option_idx);
+
+		if (arg < 0) {
+			break;
 		}
-		else if ((strcmp(argv[i], "-f") == 0) ||
-			(strcmp(argv[i], "--filter") == 0)) {
-				if (++i < argc) {
-					if (strcmp(argv[i], "enable") == 0) {
-						SET_FILTER_ON((*rule));
-					}
-					else if (strcmp(argv[i], "disable") == 0) {
-						SET_FILTER_OFF((*rule));
-					}
-					else {
-						dump_err("incorrect filter option");
-					}
+
+		switch (arg) {
+			case 'i':
+				if (inet_pton(AF_INET, optarg, &(sa.sin_addr))) {
+					rule->ip_addr = ntohl(sa.sin_addr.s_addr);
 				}
-		}
-		else if ((strcmp(argv[i], "-?") == 0) ||
-			(strcmp(argv[i], "--help") == 0)) {
+				else {
+					ERR("invalid ip address '%s'", optarg);
+				}
+				break;
+			case 'f':
+				if (strcmp(optarg, "enable") == 0) {
+					SET_FILTER_ON((*rule));
+				}
+				else if (strcmp(optarg, "disable") != 0) {
+					ERR("incorrect filter option '%s'", optarg);
+				}
+				break;
+			case '?':
 				show_usage = 1;
-		}
-		else if ((strcmp(argv[i], "-p") == 0) ||
-			(strcmp(argv[i], "--port") == 0)) {
-				if (++i < argc) {
-					unsigned p = atoi(argv[i]);
-					if (p < MAX_PORT_NUMBER) {
-						rule->port = htons(p);
-					}
-					else {
-						dump_err("incorrect port number");
-					}
+				break;
+			case 'p':
+				port = atoi(optarg);
+				if (port < USHRT_MAX) {
+					rule->port = port;
 				}
-		}
-		else if ((strcmp(argv[i], "-r") == 0) ||
-			(strcmp(argv[i], "--route") == 0)) {
-				if (++i < argc) {
-					if (strcmp(argv[i], "in") == 0) {
-						SET_ROUTE_IN((*rule));
-					}
-					else if (strcmp(argv[i], "out") == 0) {
-						SET_ROUTE_OUT((*rule));
-					}
-					else {
-						dump_err("incorrect route directon");
-					}
+				else {
+					ERR("invalid port number (max: %hu, yours: %u)",
+						USHRT_MAX, port);
 				}
-		}
-		else if ((strcmp(argv[i], "-s") == 0) ||
-			(strcmp(argv[i], "--show") == 0)) {
+				break;
+			case 'r':
+				if (strcmp(optarg, "in") == 0) {
+					SET_ROUTE_IN((*rule));
+				}
+				else if (strcmp(optarg, "out") != 0) {
+					ERR("incorrect route directon '%s'", optarg);
+				}
+				break;
+			case 's':
 				show_stats = 1;
-		}
-		else if ((strcmp(argv[i], "-t") == 0) ||
-			(strcmp(argv[i], "--transport") == 0)) {
-				if (++i < argc) {
-					if (strcmp(argv[i], "tcp") == 0) {
-						SET_PROTO_TCP((*rule));
-					}
-					else if (strcmp(argv[i], "udp") == 0) {
-						SET_PROTO_UDP((*rule));
-					}
-					else {
-						dump_err("incorrect proto type");
-					}
+				break;
+			case 't':
+				if (strcmp(optarg, "tcp") == 0) {
+					rule->proto = IPPROTO_TCP;
 				}
-		}
-		else {
-			dump_err("incorrect rule");
+				else if (strcmp(optarg, "udp") == 0) {
+					rule->proto = IPPROTO_UDP;
+				}
+				else {
+					ERR("incorrect proto type '%s'", optarg);
+				}
+				break;
+			default:
+				INF("getopt returned %d", arg);
 		}
 	}
 }
-
 
 void dump_usage_msg(void)
 {
+	int c;
+
 	puts("Usage: prog [-?s] (-i <ip> | -p <port>) -f <filter>"
 		" -r <route> -t <proto>");
 
-	puts("  -i (--ip)        : ip address to block (eg: 66.69.9.9)");
-	puts("  -f (--filter)    : filter (enable/disable)");
-	puts("  -p (--port)      : port number");
-	puts("  -r (--route)     : route direction (in/out)");
-	puts("  -s (--show)      : prints blocked rules");
-	puts("  -t (--transport) : data transfer protocol (tcp/udp)");
-	puts("  -? (--help)      : display this message");
-}
+	for (int i = 0; long_options[i].name != 0; ++i) {
+		c = long_options[i].val;
+		printf("  -%c, --%s ", c, long_options[i].name);
 
-void dump_err(char *msg)
-{
-	fprintf(stderr, "ERR: %s\n", msg);
-	close(dev_fd);
-	exit(EXIT_FAILURE);
+		switch (c) {
+			case 'i':
+				printf("       ");
+				puts(": ip address to block (fmt: a.b.c.d)");
+				break;
+			case 'f':
+				printf("   ");
+				puts(": filter (enable/disable)");
+				break;
+			case 'p':
+				printf("     ");
+				puts(": port number");
+				break;
+			case 'r':
+				printf("    ");
+				puts(": route direction (in/out)");
+				break;
+			case 's':
+				printf("     ");
+				puts(": print blocked rules");
+				break;
+			case 't':
+				puts(": data transfer protocol (tcp/udp)");
+				break;
+			case '?':
+				printf("     ");
+				puts(": display this message");
+				break;
+		}
+	}
 }

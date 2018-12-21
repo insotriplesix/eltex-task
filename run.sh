@@ -38,7 +38,8 @@ sudo ./user -t tcp -f disable
 sudo ./user --prikol 80085 --ip 1.2.3.4 -f enable
 sudo ./user --port 9999999 -f disable
 sudo ./user --ip 999.999.999.999.999 -t tcp -f enable
-sudo ./user -i 228.229.230.231 --transport udp -f ebale
+sudo ./user --ip 256.255.254.253 -t tcp -f enable
+sudo ./user -i 228.229.230.231 --transport udp -f enablez
 sudo ./user -i 4.4.24.94 --transport -f enable
 sudo ./user -i 2.2.24.50 --transport udp -f disable -r inn
 
